@@ -262,7 +262,7 @@
       args:
         creates: /etc/kubernetes/kubelet.conf
 
-handlers:
+- handlers:
   - name: Reload systemd
     systemd:
       daemon_reload: yes
