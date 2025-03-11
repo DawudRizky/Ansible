@@ -1,16 +1,11 @@
 ---
-# Master playbook for Kubernetes cluster setup
-- name: Setup Kubernetes prerequisites on all nodes
+- name: Setup prerequisites on all nodes
   hosts: all
   become: yes
   tasks:
-    - name: Update apt cache
+    - name: Update apt cache and install required packages
       apt:
         update_cache: yes
-        cache_valid_time: 3600
-
-    - name: Install common dependencies
-      apt:
         name:
           - git
           - wget
@@ -22,367 +17,252 @@
           - lsb-release
         state: present
 
-    - name: Create directory for apt keyrings
-      file:
-        path: /etc/apt/keyrings
-        state: directory
-        mode: '0755'
-
-    - name: Download Docker GPG key
+- name: Install Docker on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Add Docker GPG key
       get_url:
         url: https://download.docker.com/linux/ubuntu/gpg
-        dest: ./docker.key
-        mode: '0644'
+        dest: /tmp/docker.key
 
-    - name: Import Docker GPG key
+    - name: Import Docker GPG key and export to archive
       shell: |
-        gpg --no-default-keyring --keyring ./docker.gpg --import ./docker.key
-        gpg --no-default-keyring --keyring ./docker.gpg --export > ./docker-archive-keyring.gpg
-        mv ./docker-archive-keyring.gpg /etc/apt/trusted.gpg.d/
+        gpg --no-default-keyring --keyring /tmp/docker.gpg --import /tmp/docker.key
+        gpg --no-default-keyring --keyring /tmp/docker.gpg --export > /tmp/docker-archive-keyring.gpg
+      args:
+        executable: /bin/bash
+
+    - name: Move Docker keyring to trusted location
+      copy:
+        src: /tmp/docker-archive-keyring.gpg
+        dest: /etc/apt/trusted.gpg.d/docker-archive-keyring.gpg
+        remote_src: yes
 
     - name: Add Docker repository
       apt_repository:
         repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
         state: present
 
-    - name: Install Docker
+    - name: Update apt cache after adding Docker repo
+      apt:
+        update_cache: yes
+
+    - name: Install Docker CE
       apt:
         name: docker-ce
         state: present
-        update_cache: yes
 
-    - name: Create docker group
-      group:
-        name: docker
-        state: present
+- name: Install cri-dockerd on all nodes
+  hosts: all
+  become: yes
+  vars:
+    cri_dockerd_api_url: "https://api.github.com/repos/Mirantis/cri-dockerd/releases/latest"
+  tasks:
+    - name: Get latest cri-dockerd release info
+      uri:
+        url: "{{ cri_dockerd_api_url }}"
+        return_content: yes
+      register: cri_release_info
 
-    - name: Add user to docker group
-      user:
-        name: "{{ ansible_user }}"
-        groups: docker
-        append: yes
+    - name: Set cri-dockerd version variable
+      set_fact:
+        cri_dockerd_version: "{{ cri_release_info.json.tag_name | regex_replace('^v','') }}"
 
-    - name: Install cri-dockerd
-      block:
-        - name: Get latest cri-dockerd version
-          shell: curl -s https://api.github.com/repos/Mirantis/cri-dockerd/releases/latest | grep tag_name | cut -d '"' -f 4 | sed 's/v//g'
-          register: cri_dockerd_version
-          changed_when: false
+    - name: Download cri-dockerd tarball
+      get_url:
+        url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version }}/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+        dest: "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
 
-        - name: Download cri-dockerd
-          get_url:
-            url: "https://github.com/Mirantis/cri-dockerd/releases/download/v{{ cri_dockerd_version.stdout }}/cri-dockerd-{{ cri_dockerd_version.stdout }}.amd64.tgz"
-            dest: "/tmp/cri-dockerd-{{ cri_dockerd_version.stdout }}.amd64.tgz"
+    - name: Extract cri-dockerd tarball
+      unarchive:
+        src: "/tmp/cri-dockerd-{{ cri_dockerd_version }}.amd64.tgz"
+        dest: /tmp/
+        remote_src: yes
 
-        - name: Extract cri-dockerd
-          unarchive:
-            src: "/tmp/cri-dockerd-{{ cri_dockerd_version.stdout }}.amd64.tgz"
-            dest: /tmp
-            remote_src: yes
+    - name: Move cri-dockerd binary to /usr/local/bin
+      copy:
+        src: "/tmp/cri-dockerd/cri-dockerd"
+        dest: /usr/local/bin/cri-dockerd
+        mode: '0755'
+        remote_src: yes
 
-        - name: Move cri-dockerd binary
-          copy:
-            src: /tmp/cri-dockerd/cri-dockerd
-            dest: /usr/local/bin/cri-dockerd
-            mode: '0755'
-            remote_src: yes
+    - name: Download cri-dockerd systemd service file
+      get_url:
+        url: "https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service"
+        dest: /etc/systemd/system/cri-docker.service
+      notify: Reload systemd
 
-        - name: Download cri-docker service file
-          get_url:
-            url: https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.service
-            dest: /etc/systemd/system/cri-docker.service
-            mode: '0644'
+    - name: Download cri-dockerd socket file
+      get_url:
+        url: "https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket"
+        dest: /etc/systemd/system/cri-docker.socket
+      notify: Reload systemd
 
-        - name: Download cri-docker socket file
-          get_url:
-            url: https://raw.githubusercontent.com/Mirantis/cri-dockerd/master/packaging/systemd/cri-docker.socket
-            dest: /etc/systemd/system/cri-docker.socket
-            mode: '0644'
+    - name: Update cri-docker.service file with correct path
+      replace:
+        path: /etc/systemd/system/cri-docker.service
+        regexp: "/usr/bin/cri-dockerd"
+        replace: "/usr/local/bin/cri-dockerd"
+      notify: Reload systemd
 
-        - name: Update cri-docker service path
-          replace:
-            path: /etc/systemd/system/cri-docker.service
-            regexp: '/usr/bin/cri-dockerd'
-            replace: '/usr/local/bin/cri-dockerd'
+    - name: Enable and start cri-dockerd service
+      systemd:
+        name: cri-docker.service
+        enabled: yes
+        state: started
 
-        - name: Enable cri-docker service and socket
-          systemd:
-            name: "{{ item }}"
-            daemon_reload: yes
-            enabled: yes
-            state: started
-          loop:
-            - cri-docker.socket
-            - cri-docker.service
+    - name: Enable and start cri-dockerd socket
+      systemd:
+        name: cri-docker.socket
+        enabled: yes
+        state: started
+
+- name: Install Kubernetes components on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Create apt keyrings directory
+      file:
+        path: /etc/apt/keyrings
+        state: directory
 
     - name: Add Kubernetes GPG key
-      shell: |
-        curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      get_url:
+        url: https://pkgs.k8s.io/core:/stable:/v1.31/deb/Release.key
+        dest: /tmp/k8s_release.key
+
+    - name: Convert Kubernetes key to apt-keyring format
+      shell: "gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg /tmp/k8s_release.key"
       args:
         creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 
     - name: Add Kubernetes repository
-      shell: |
-        echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /" > /etc/apt/sources.list.d/kubernetes.list
-      args:
-        creates: /etc/apt/sources.list.d/kubernetes.list
+      copy:
+        content: 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.31/deb/ /'
+        dest: /etc/apt/sources.list.d/kubernetes.list
 
-    - name: Install Kubernetes packages
+    - name: Update apt cache after adding Kubernetes repo
+      apt:
+        update_cache: yes
+
+    - name: Install kubelet, kubeadm, and kubectl
       apt:
         name:
           - kubelet
           - kubeadm
           - kubectl
         state: present
-        update_cache: yes
 
-    - name: Hold Kubernetes and Docker packages
-      dpkg_selections:
-        name: "{{ item }}"
-        selection: hold
-      loop:
-        - docker-ce
-        - kubelet
-        - kubeadm
-        - kubectl
+    - name: Hold Kubernetes packages to prevent automatic updates
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: hold
 
-    - name: Configure kernel modules for k8s
+- name: Configure system for Kubernetes on all nodes
+  hosts: all
+  become: yes
+  tasks:
+    - name: Load required kernel modules
       copy:
         dest: /etc/modules-load.d/k8s.conf
         content: |
           overlay
           br_netfilter
-        mode: '0644'
 
-    - name: Load kernel modules
+    - name: Ensure kernel modules are loaded
       shell: |
         modprobe overlay
         modprobe br_netfilter
-      changed_when: false
+      args:
+        warn: false
 
-    - name: Configure sysctl for k8s
+    - name: Set sysctl params for Kubernetes
       copy:
         dest: /etc/sysctl.d/k8s.conf
         content: |
           net.bridge.bridge-nf-call-iptables  = 1
           net.bridge.bridge-nf-call-ip6tables = 1
           net.ipv4.ip_forward                 = 1
-        mode: '0644'
 
-    - name: Apply sysctl parameters
+    - name: Apply sysctl params
       command: sysctl --system
-      changed_when: false
 
-    - name: Disable swap
+    - name: Disable swap immediately
       command: swapoff -a
-      changed_when: false
 
     - name: Disable swap in fstab
       replace:
         path: /etc/fstab
-        regexp: '^([^#].*\sswap\s+.*)$'
+        regexp: '^([^#].*swap.*)$'
         replace: '# \1'
 
-- name: Initialize Kubernetes master node
-  hosts: master
+- name: Initialize Kubernetes control-plane (Master)
+  hosts: control_plane
   become: yes
   vars:
-    pod_network_cidr: 192.244.0.0/16  # Change to 10.244.0.0/16 if node network is 192.168.x.x
+    # Automatically determine the control-plane IP from the default interface
+    control_plane_ip: "{{ ansible_default_ipv4.address }}"
+    # Set pod network CIDR conditionally to avoid conflict with host network
+    pod_network_cidr: >-
+      {% if '192.168.' in ansible_default_ipv4.address %}
+        10.244.0.0/16
+      {% else %}
+        192.168.0.0/16
+      {% endif %}
   tasks:
-    - name: Get master node IP
-      shell: hostname -I | awk '{print $1}'
-      register: master_ip
-      changed_when: false
-
-    - name: Initialize Kubernetes cluster
-      shell: >
-        kubeadm init 
-        --apiserver-advertise-address={{ master_ip.stdout }} 
-        --cri-socket unix:///var/run/cri-dockerd.sock 
-        --pod-network-cidr={{ pod_network_cidr }}
+    - name: Initialize Kubernetes cluster with kubeadm
+      shell: |
+        kubeadm init --apiserver-advertise-address={{ control_plane_ip }} \
+        --cri-socket unix:///var/run/cri-dockerd.sock \
+        --pod-network-cidr={{ pod_network_cidr }} | tee /tmp/kubeadm_init.out
       args:
         creates: /etc/kubernetes/admin.conf
-      register: kubeadm_init
+      register: kubeadm_init_output
 
-    - name: Print join command
-      debug:
-        msg: "{{ kubeadm_init.stdout_lines }}"
-      when: kubeadm_init.changed
-
-    - name: Extract join command
+    - name: Save kubeadm join command
       shell: kubeadm token create --print-join-command
       register: join_command
       changed_when: false
-      when: kubeadm_init.changed
 
-    - name: Save join command to a file
-      copy:
-        content: "{{ join_command.stdout }} --cri-socket unix:///var/run/cri-dockerd.sock"
-        dest: /tmp/kubeadm_join_cmd.sh
-        mode: '0644'
-      when: kubeadm_init.changed
+    - name: Display join command
+      debug:
+        msg: "Use the following command on worker nodes to join the cluster: {{ join_command.stdout }}"
 
-    - name: Fetch join command
-      fetch:
-        src: /tmp/kubeadm_join_cmd.sh
-        dest: ./kubeadm_join_cmd.sh
-        flat: yes
-      when: kubeadm_init.changed
+    - name: Set up kubeconfig for the current user
+      become: yes
+      become_user: "{{ ansible_user }}"
+      shell: |
+        mkdir -p $HOME/.kube
+        sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+        sudo chown $(id -u):$(id -g) $HOME/.kube/config
+      args:
+        executable: /bin/bash
 
-    - name: Create .kube directory for current user
-      file:
-        path: "/home/{{ ansible_user }}/.kube"
-        state: directory
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-        mode: '0755'
-
-    - name: Copy admin.conf to user's kube config
-      copy:
-        src: /etc/kubernetes/admin.conf
-        dest: "/home/{{ ansible_user }}/.kube/config"
-        remote_src: yes
-        owner: "{{ ansible_user }}"
-        group: "{{ ansible_user }}"
-        mode: '0644'
-
-    - name: Install Calico network plugin
-      become: no
+    - name: Deploy Calico network plugin
       shell: |
         kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/tigera-operator.yaml
-        curl https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/custom-resources.yaml -O
-        # Adjust CIDR if needed based on pod_network_cidr
-        {% if pod_network_cidr == "10.244.0.0/16" %}
-        sed -i 's|192.168.0.0/16|10.244.0.0/16|g' custom-resources.yaml
-        {% endif %}
+        curl -O https://raw.githubusercontent.com/projectcalico/calico/v3.28.2/manifests/custom-resources.yaml
         kubectl create -f custom-resources.yaml
       args:
-        chdir: "/home/{{ ansible_user }}"
-      register: calico_result
-      changed_when: "'created' in calico_result.stdout"
-      failed_when: false
-
-    - name: Install metrics server
-      become: no
-      block:
-        - name: Clone metrics server repository
-          git:
-            repo: https://github.com/mialeevs/kubernetes_installation_docker.git
-            dest: "/home/{{ ansible_user }}/kubernetes_installation_docker"
-            
-        - name: Apply metrics server
-          shell: kubectl apply -f metrics-server.yaml
-          args:
-            chdir: "/home/{{ ansible_user }}/kubernetes_installation_docker"
-            
-        - name: Clean up repository
-          file:
-            path: "/home/{{ ansible_user }}/kubernetes_installation_docker"
-            state: absent
-
-    - name: Install Helm
-      shell: |
-        curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3
-        chmod +x get_helm.sh
-        ./get_helm.sh
-      args:
-        creates: /usr/local/bin/helm
-
-    - name: Add Kubernetes Dashboard Helm repository
-      become: no
-      shell: helm repo add kubernetes-dashboard https://kubernetes.github.io/dashboard/
-      changed_when: false
-
-    - name: Install Kubernetes Dashboard
-      become: no
-      shell: >
-        helm upgrade --install kubernetes-dashboard kubernetes-dashboard/kubernetes-dashboard 
-        --create-namespace --namespace kubernetes-dashboard
-      changed_when: false
-
-    - name: Expose Kubernetes Dashboard as NodePort
-      become: no
-      shell: >
-        kubectl expose deployment kubernetes-dashboard-kong 
-        --name k8s-dash-svc --type NodePort --port 443 --target-port 8443 
-        -n kubernetes-dashboard
-      failed_when: false
-
-    - name: Create Dashboard admin user and role
-      become: no
-      copy:
-        dest: "/home/{{ ansible_user }}/k8s-dash.yaml"
-        content: |
-          apiVersion: v1
-          kind: ServiceAccount
-          metadata:
-            name: admin-user
-            namespace: kube-system
-          ---
-          apiVersion: rbac.authorization.k8s.io/v1
-          kind: ClusterRoleBinding
-          metadata:
-            name: admin-user
-          roleRef:
-            apiGroup: rbac.authorization.k8s.io
-            kind: ClusterRole
-            name: cluster-admin
-          subjects:
-          - kind: ServiceAccount
-            name: admin-user
-            namespace: kube-system
-        mode: '0644'
-
-    - name: Apply Dashboard admin user and role
-      become: no
-      shell: kubectl apply -f k8s-dash.yaml
-      args:
-        chdir: "/home/{{ ansible_user }}"
-      changed_when: false
-
-    - name: Get token for Dashboard login
-      become: no
-      shell: kubectl -n kube-system create token admin-user --duration=168h
-      register: dashboard_token
-      changed_when: false
-
-    - name: Display Dashboard token
-      debug:
-        msg: "Dashboard Login Token: {{ dashboard_token.stdout }}"
-
-    - name: Get NodePort for Dashboard
-      become: no
-      shell: kubectl get svc k8s-dash-svc -n kubernetes-dashboard -o jsonpath='{.spec.ports[0].nodePort}'
-      register: dashboard_port
-      changed_when: false
-      failed_when: false
-
-    - name: Display Dashboard access information
-      debug:
-        msg: 
-          - "Dashboard available at: https://{{ master_ip.stdout }}:{{ dashboard_port.stdout }}"
-          - "Use the token above to log in"
-      when: dashboard_port.rc == 0
+        executable: /bin/bash
 
 - name: Join worker nodes to the cluster
-  hosts: workers
+  hosts: worker
   become: yes
+  vars:
+    # Retrieve the join command saved on the first control-plane node
+    join_command: "{{ hostvars[groups['control_plane'][0]].join_command.stdout }}"
   tasks:
-    - name: Check if node is already joined
-      shell: kubectl get nodes | grep {{ inventory_hostname }}
-      register: node_check
-      delegate_to: "{{ groups['master'][0] }}"
-      failed_when: false
-      changed_when: false
-      ignore_errors: yes
+    - name: Join the cluster using kubeadm join command
+      shell: "{{ join_command }} --cri-socket unix:///var/run/cri-dockerd.sock"
+      args:
+        creates: /etc/kubernetes/kubelet.conf
 
-    - name: Copy join command from master
-      copy:
-        src: ./kubeadm_join_cmd.sh
-        dest: /tmp/kubeadm_join_cmd.sh
-        mode: '0755'
-      when: node_check.rc != 0
-
-    - name: Join the cluster
-      shell: sh /tmp/kubeadm_join_cmd.sh
-      when: node_check.rc != 0
+handlers:
+  - name: Reload systemd
+    systemd:
+      daemon_reload: yes
